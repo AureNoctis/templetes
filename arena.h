@@ -2,6 +2,7 @@
 #define ARENA_
 
 
+#include <memoryapi.h>
 #if defined(__clang__)
 #define COMPILER_CLANG 1
 #define COMPILER_MSVC 0
@@ -137,6 +138,10 @@ typedef unsigned long long u64;
 typedef float  f32;
 typedef double f64;
 
+
+#include <stdio.h>
+
+
 /* ======================================================================= */
 /*                              decelaration                               */
 /* ======================================================================= */
@@ -161,7 +166,7 @@ typedef struct Arena{
 #define ARENA_HEADER_SIZE align_up_pow2(sizeof(Arena), 64)
 
 /* .... global var .... */
-global u64 page_size;
+global u64 global_page_size;
 
 
 /* .... function .... */
@@ -169,11 +174,11 @@ global u64 page_size;
 OPTIONS(ArenaOpt, u64 commit_size;);
 internal Arena* arena_alloc(u64 reserve_size, ArenaOpt opt);
 internal void* arena_push(Arena* arena, u64 size, u64 alignment);
-internal void* arena_release(Arena* arena);
-internal void* arena_reset(Arena* arena);
+internal void arena_release(Arena* arena);
+internal void arena_reset(Arena* arena);
 
-
-
+#define arena_push_type(arena, T) arena_push(arena, sizeof(T), align_of(T))
+#define arena_push_array(arena, T, count) arena_push(arena, (count * sizeof(T)), align_of(T))
 
 #ifdef LANG_CPP
 }
@@ -219,8 +224,38 @@ internal Arena* arena_alloc(u64 reserve_size, ArenaOpt opt){
 	return arena;
 }
 
+internal void* arena_push(Arena *arena, u64 size, u64 alignment){
+    u64 begin;
+    u64 end;
+    void* user_ptr;
 
+    if(!arena)
+        fprintf(stderr, "ERROR: Arena is null\n");
+    
+    begin = align_up_pow2(arena->cursor, alignment);
+    end = begin + size;
 
+    if(end > arena->committed && end <= arena->reserved){
+        u64 required_size = end - arena->committed;
+        required_size = align_up_pow2(required_size, global_page_size);
+        arena->committed += required_size;
+        VirtualAlloc((u8*)arena + arena->committed, required_size, MEM_COMMIT, PAGE_READWRITE);
+    }
+
+    arena->cursor += end;
+    user_ptr = (u8*)arena + begin;
+    return user_ptr;
+}
+
+internal void arena_reset(Arena* arena) {
+	arena->cursor		   = ARENA_HEADER_SIZE;
+	arena->temp_stack_head = 0;
+	arena->temp_stack_tail = 0;
+}
+
+internal void arena_release(Arena *arena){
+    VirtualFree(arena, 0, MEM_RELEASE);
+}
 
 #endif
 #endif
