@@ -2,7 +2,6 @@
 #define ARENA_
 
 
-#include <memoryapi.h>
 #if defined(__clang__)
 #define COMPILER_CLANG 1
 #define COMPILER_MSVC 0
@@ -124,6 +123,40 @@
 		__VA_ARGS__                                                                                                                                       \
 	} T
 
+
+/* LinkList */
+#define dll_push_back_np(head, tail, node, next, prev)                                                                 \
+    ((head) == 0 ? ((head) = (tail) = (node), (node)->next = (node)->prev = 0)                                         \
+                 : ((node)->prev = (tail), (tail)->next = (node), (tail) = (node), (node)->next = 0))
+
+#define dll_remove_np(head, tail, node, next, prev)                                                                    \
+    ((head) == (node) ? ((head) == (tail) ? ((head) = (tail) = 0) : ((head) = (head)->next, (head)->prev = 0))         \
+                      : ((tail) == (node) ? ((tail) = (tail)->prev, (tail)->next = 0)                                  \
+                                          : ((node)->next->prev = (node)->prev, (node)->prev->next = (node)->next)))
+
+#define sll_push_front_n(head, tail, node, next)                                                                       \
+    ((node)->next = (head), ((head) == 0 ? (tail) = (node) : 0), (head) = (node))
+
+#define sll_push_back_n(head, tail, node, next)                                                                        \
+    ((node)->next = 0, ((head) == 0 ? ((head) = (node)) : ((tail)->next = (node))), (tail) = (node))
+
+#define sll_pop_front_n(head, tail, next) ((head) == (tail) ? ((head) = (tail) = 0) : ((head) = (head)->next))
+
+#define dll_push_front_np(head, tail, node, next, prev) dll_push_back_np(tail, head, node, prev, next)
+
+#define dll_push_back(head, tail, node) dll_push_back_np(head, tail, node, next, prev)
+#define dll_push_front(head, tail, node) dll_push_front_np(head, tail, node, next, prev)
+#define dll_remove(head, tail, node) dll_remove_np(head, tail, node, next, prev)
+
+#define sll_push_front(head, tail, node) sll_push_front_n(head, tail, node, next)
+#define sll_push_back(head, tail, node) sll_push_back_n(head, tail, node, next)
+#define sll_pop_front(head, tail) sll_pop_front_n(head, tail, next)
+#define sll_stack_push(head, tail, node) sll_push_front(head, tail, node)
+#define sll_stack_pop(head, tail) sll_pop_front(head, tail)
+#define sll_queue_push(head, tail, node) sll_push_back(head, tail, node)
+#define sll_queue_pop(head, tail) sll_pop_front(head, tail)
+
+
 /*  Base Type  */
 typedef signed char	i8;
 typedef short       i16;
@@ -173,12 +206,16 @@ global u64 global_page_size;
 
 OPTIONS(ArenaOpt, u64 commit_size;);
 internal Arena* arena_alloc(u64 reserve_size, ArenaOpt opt);
-internal void* arena_push(Arena* arena, u64 size, u64 alignment);
-internal void arena_release(Arena* arena);
-internal void arena_reset(Arena* arena);
+internal void*	arena_push(Arena* arena, u64 size, u64 alignment);
+internal void	arena_release(Arena* arena);
+internal void	arena_reset(Arena* arena);
 
 #define arena_push_type(arena, T) arena_push(arena, sizeof(T), align_of(T))
 #define arena_push_array(arena, T, count) arena_push(arena, (count * sizeof(T)), align_of(T))
+
+internal void arena_temp_begin(Arena* arena);
+internal void arena_temp_end(Arena* arena);
+internal void arena_temp_end_all(Arena* arena);
 
 #ifdef LANG_CPP
 }
@@ -188,9 +225,10 @@ internal void arena_reset(Arena* arena);
 /*                             implementation                              */
 /* ======================================================================= */
 
-/* for now */ #define ARENA_IMPLEMENTATION
 
 #ifdef ARENA_IMPLEMENTATION
+
+#if OS_WINDOWS
 
 internal Arena* arena_alloc(u64 reserve_size, ArenaOpt opt){
 #if LANG_C
@@ -199,19 +237,34 @@ internal Arena* arena_alloc(u64 reserve_size, ArenaOpt opt){
 	SYSTEM_INFO sys_info = {0};
 #endif
 	Arena* arena;
-	u64	   page_size;
 	void*  memory;
-	if(page_size == 0){
+    u32 error_code;
+	if(global_page_size == 0){
         GetSystemInfo(&sys_info);
-		page_size = sys_info.dwPageSize;
+		global_page_size = sys_info.dwPageSize;
 	}
     
-    reserve_size    = align_up_pow2(reserve_size, page_size);
+    reserve_size    = align_up_pow2(reserve_size, global_page_size);
     // by default commit just one page
-    opt.commit_size = (opt.commit_size) ? align_up_pow2(opt.commit_size, page_size) : page_size;
-    
-    memory = VirtualAlloc(0, reserve_size, MEM_RESERVE, PAGE_READWRITE);
-    VirtualAlloc(memory, opt.commit_size, MEM_COMMIT, PAGE_READWRITE);
+	opt.commit_size = (opt.commit_size) ? align_up_pow2(opt.commit_size, global_page_size) : global_page_size;
+
+    if (opt.commit_size > reserve_size) {
+		opt.commit_size = reserve_size;
+	}
+
+	memory = VirtualAlloc(0, reserve_size, MEM_RESERVE, PAGE_READWRITE);
+    if(!memory){
+        error_code = GetLastError();
+        fprintf(stderr, "ERROR: VirtualAlloc Failed While Reserving: 0x%X\n", error_code);
+        return NULL;
+    }
+
+	if (!VirtualAlloc(memory, opt.commit_size, MEM_COMMIT, PAGE_READWRITE)) {
+		error_code = GetLastError();
+		fprintf(stderr, "ERROR: VirtualAlloc Failed While Committing: 0x%X\n", error_code);
+        VirtualFree(memory, 0, MEM_RELEASE); 
+		return NULL;
+	}
 
 	arena = (Arena*)memory;
 
@@ -227,35 +280,119 @@ internal Arena* arena_alloc(u64 reserve_size, ArenaOpt opt){
 internal void* arena_push(Arena *arena, u64 size, u64 alignment){
     u64 begin;
     u64 end;
+    u64 error_code;
     void* user_ptr;
 
-    if(!arena)
-        fprintf(stderr, "ERROR: Arena is null\n");
+    if(!arena){
+        fprintf(stderr, "ERROR: Arena is NULL\n");
+        return NULL;
+    }
     
     begin = align_up_pow2(arena->cursor, alignment);
     end = begin + size;
 
-    if(end > arena->committed && end <= arena->reserved){
+    if(end > arena->reserved){
+        fprintf(stderr, "ERROR: Arena overflow:\n"
+                        "           Reserved: %lld\n"
+                        "           Required: %lld\n", 
+                        arena->reserved, end);
+        return NULL;
+    }
+    if(end > arena->committed){
         u64 required_size = end - arena->committed;
         required_size = align_up_pow2(required_size, global_page_size);
+        
+        if(!VirtualAlloc((u8*)arena + arena->committed, required_size, MEM_COMMIT, PAGE_READWRITE)){
+            error_code = GetLastError();
+            fprintf(stderr, "ERROR: VirtualAlloc Failed during arena_push: 0x%llX\n", error_code);
+            return NULL;
+        }
         arena->committed += required_size;
-        VirtualAlloc((u8*)arena + arena->committed, required_size, MEM_COMMIT, PAGE_READWRITE);
     }
 
-    arena->cursor += end;
+    arena->cursor = end;
     user_ptr = (u8*)arena + begin;
     return user_ptr;
 }
 
 internal void arena_reset(Arena* arena) {
+	if (!arena) {
+		fprintf(stderr, "ERROR: Arena is NULL\n");
+		return;
+	}
+
 	arena->cursor		   = ARENA_HEADER_SIZE;
 	arena->temp_stack_head = 0;
 	arena->temp_stack_tail = 0;
 }
 
 internal void arena_release(Arena *arena){
-    VirtualFree(arena, 0, MEM_RELEASE);
+    u32 error_code;
+    if (!arena) {
+		fprintf(stderr, "ERROR: Arena is NULL\n");
+		return;
+	}
+
+	if(!VirtualFree(arena, 0, MEM_RELEASE)){
+        error_code = GetLastError();
+        fprintf(stderr, "ERROR: VirtualFree Failed: 0x%X\n", error_code);
+    }
 }
+
+/* ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ */
+
+internal void arena_temp_begin(Arena* arena){
+    ArenaTempNode* node;
+    u64 cursor;
+
+	if (!arena) {
+		fprintf(stderr, "ERROR: Arena is NULL\n");
+		return;
+	}
+    cursor = arena->cursor;
+
+    node = (ArenaTempNode*)arena_push_type(arena, ArenaTempNode);
+    if(!node){
+        fprintf(stderr, "ERROR: arena_temp_begin failed\n");
+        return;
+    }
+
+    node->start_cursor = cursor;
+
+    sll_stack_push(arena->temp_stack_head, arena->temp_stack_tail, node);
+}
+
+internal void arena_temp_end(Arena* arena){
+	if (!arena) {
+		fprintf(stderr, "ERROR: Arena is NULL\n");
+		return;
+	}
+	
+    if(arena->temp_stack_head){
+        arena->cursor = arena->temp_stack_head->start_cursor;
+        sll_stack_pop(arena->temp_stack_head, arena->temp_stack_tail);
+    }else{
+        fprintf(stderr, "NOTE: arena_temp_end: temp stack was empty\n");
+    }
+}
+
+internal void arena_temp_end_all(Arena* arena){
+	if (!arena) {
+		fprintf(stderr, "ERROR: Arena is NULL\n");
+		return;
+	}
+
+	if(arena->temp_stack_tail){
+        arena->cursor = arena->temp_stack_tail->start_cursor;
+    }else{
+        fprintf(stderr, "NOTE: arena_temp_end_all: temp stack was empty\n");
+    }
+
+	arena->temp_stack_tail = 0;
+    arena->temp_stack_head = 0;
+}
+
+#endif
 
 #endif
 #endif
